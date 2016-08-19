@@ -312,8 +312,8 @@ if __name__ == '__main__':
 
     max_exps = 50
 
-    updateFreq = 5
-    update_steps = 5
+    updateFreq = 1
+    update_steps = 1
 
     updateCrFreq = 1
     updateCr_steps = 20
