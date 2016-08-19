@@ -61,17 +61,21 @@ class BasicAgent(object):
                  n_layers=0,
                  n_hidden=10,
                  disc_factor=1.,
-                 n_frames=1):
+                 n_frames=1,
+                 scale=0.1):
+
         self.action_space = action_space
         self.obs_space = obs_space
         self.disc_factor = disc_factor # not used yet
         self.n_frames = n_frames
+        self.scale = scale
 
         self.n_layers = n_layers
         self.n_hidden = n_hidden
 
         self.n_exp = 0
         self.exps = []
+        self.scores = []
 
         self.trng = RandomStreams(1234)
 
@@ -100,16 +104,24 @@ class BasicAgent(object):
         self.exps.append([])
 
     def episode_end(self):
+        self.scores.append(numpy.sum([ex[2] for ex in self.exps[-1]]))
         self.begin = False
 
     def record(self, obs, reward):
         self.exps[-1].append([obs, self.last_act, reward])
 
+    def count_exps(self):
+        return len(self.exps)
+
     def flush_exps(self, n=-1):
         if n < 0:
             self.exps = []
+            self.scores = []
+        elif n <= 0:
+            return
         else:
             del self.exps[:n]
+            del self.scores[:n]
 
     def obs_dim(self):
         if type(self.obs_space) == gym.spaces.box.Box:
@@ -130,25 +142,25 @@ class BasicAgent(object):
     def param_init(self):
         self.params = OrderedDict()
 
-        self.params['W'] = theano.shared(0.1 * numpy.random.randn(self.obs_dim() * self.n_frames, self.n_hidden).astype('float32'))
+        self.params['W'] = theano.shared(self.scale * numpy.random.randn(self.obs_dim() * self.n_frames, self.n_hidden).astype('float32'))
         self.params['b'] = theano.shared(numpy.zeros(self.n_hidden).astype('float32'))
         for li in xrange(self.n_layers):
             self.params['W{}'.format(li+1)] = theano.shared(0.1 * numpy.random.randn(self.n_hidden, self.n_hidden).astype('float32'))
             self.params['b{}'.format(li+1)] = theano.shared(numpy.zeros(self.n_hidden).astype('float32'))
-        self.params['U'] = theano.shared(0.1 * numpy.random.randn(self.n_hidden, self.act_dim()).astype('float32'))
+        self.params['U'] = theano.shared(self.scale * numpy.random.randn(self.n_hidden, self.act_dim()).astype('float32'))
         self.params['c'] = theano.shared(numpy.zeros(self.act_dim()).astype('float32'))
 
         # reward predictor
         self.params_cr = OrderedDict()
 
-        self.params_cr['W'] = theano.shared(0.1 * numpy.random.randn(self.obs_dim() * self.n_frames, self.n_hidden).astype('float32'))
+        self.params_cr['W'] = theano.shared(self.scale * numpy.random.randn(self.obs_dim() * self.n_frames, self.n_hidden).astype('float32'))
         #self.params_cr['W'] = self.params['W']
-        self.params_cr['V'] = theano.shared(0.1 * numpy.random.randn(self.act_dim(), self.n_hidden).astype('float32'))
+        self.params_cr['V'] = theano.shared(self.scale * numpy.random.randn(self.act_dim(), self.n_hidden).astype('float32'))
         self.params_cr['b'] = theano.shared(numpy.zeros(self.n_hidden).astype('float32'))
         for li in xrange(self.n_layers):
             self.params_cr['W{}'.format(li+1)] = theano.shared(0.1 * numpy.random.randn(self.n_hidden, self.n_hidden).astype('float32'))
             self.params_cr['b{}'.format(li+1)] = theano.shared(numpy.zeros(self.n_hidden).astype('float32'))
-        self.params_cr['U'] = theano.shared(0.1 * numpy.random.randn(self.n_hidden, 1).astype('float32'))
+        self.params_cr['U'] = theano.shared(self.scale * numpy.random.randn(self.n_hidden, 1).astype('float32'))
         self.params_cr['c'] = theano.shared(numpy.zeros((1,)).astype('float32'))
 
     def tensor_init(self):
@@ -220,8 +232,12 @@ class BasicAgent(object):
         acts = numpy.zeros((n, self.act_dim())).astype('int64')
         rewards = numpy.zeros((n,)).astype('float32')
 
+        ss = numpy.array(self.scores)
+        pp = numpy.exp(ss) / numpy.exp(ss).sum()
+
         for ni in xrange(n):
             e = numpy.random.choice(len(self.exps))
+            #e = numpy.argmax(numpy.random.multinomial(1, pp))
             o = numpy.random.choice(len(self.exps[e]))
             for ii in xrange(self.n_frames):
                 try:
@@ -278,7 +294,7 @@ if __name__ == '__main__':
 
     env = gym.make('Acrobot-v1' if len(sys.argv)<2 else sys.argv[1])
     agent = BasicAgent(env.action_space, env.observation_space, 
-            n_hidden=10, n_frames=1, n_layers=2)
+            n_hidden=10, n_frames=1, n_layers=3)
 
     # You provide the directory to write to (can be an existing
     # directory, but can't contain previous monitor results. You can
@@ -292,12 +308,14 @@ if __name__ == '__main__':
     done = False
 
     dispFreq = 10
-    flushFreq = 200
+    #flushFreq = 100
 
-    updateFreq = 10
-    update_steps = 20
+    max_exps = 50
 
-    updateCrFreq = 5
+    updateFreq = 5
+    update_steps = 5
+
+    updateCrFreq = 1
     updateCr_steps = 20
 
     for i in range(episode_count):
@@ -330,10 +348,12 @@ if __name__ == '__main__':
                 agent.update()
             #print 'Done'
 
-        if numpy.mod(i, flushFreq) == 0:
-            print 'Flushing experiences..',
-            agent.flush_exps()
-            print 'Done'
+        #if numpy.mod(i, flushFreq) == 0:
+        #    print 'Flushing experiences..',
+        #    agent.flush_exps()
+        #    print 'Done'
+        if agent.count_exps() >= max_exps:
+            agent.flush_exps(1)
 
     # Dump result info to disk
     env.monitor.close()
