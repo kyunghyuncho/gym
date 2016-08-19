@@ -58,7 +58,7 @@ class BasicAgent(object):
     def __init__(self, 
                  action_space, 
                  obs_space,
-                 n_layers=2,
+                 n_layers=0,
                  n_hidden=10,
                  disc_factor=1.,
                  n_frames=1):
@@ -278,7 +278,7 @@ if __name__ == '__main__':
 
     env = gym.make('Acrobot-v1' if len(sys.argv)<2 else sys.argv[1])
     agent = BasicAgent(env.action_space, env.observation_space, 
-            n_hidden=10, n_frames=1)
+            n_hidden=10, n_frames=1, n_layers=2)
 
     # You provide the directory to write to (can be an existing
     # directory, but can't contain previous monitor results. You can
@@ -292,13 +292,13 @@ if __name__ == '__main__':
     done = False
 
     dispFreq = 10
-    flushFreq = 500
+    flushFreq = 200
 
-    updateFreq = 5
-    update_steps = 10
+    updateFreq = 10
+    update_steps = 20
 
-    updateCrFreq = 1
-    updateCr_steps = 50
+    updateCrFreq = 5
+    updateCr_steps = 20
 
     for i in range(episode_count):
         ob = env.reset()
