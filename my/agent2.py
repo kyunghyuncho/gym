@@ -14,6 +14,27 @@ import gym
 def sigmoid(x):
     return 1./(1. + numpy.exp(-x))
 
+def grad_clip(grads, t=numpy.float32(1.)):
+    gnorm = numpy.float32(0.)
+    for gg in grads:
+        gnorm = gnorm + (gg ** 2).sum()
+
+    new_grads = []
+    for gg in grads:
+        new_gg = tensor.switch(tensor.sqrt(gnorm) > t,
+                               gg / tensor.sqrt(gnorm) * t,
+                               gg)
+        new_grads.append(new_gg)
+
+    return new_grads
+
+def weight_decay(params, grads, coeff=numpy.float32(0.001)):
+    new_grads = []
+    for gg, pp in zip(grads,params.values()):
+        new_grads.append(gg + coeff * pp)
+
+    return new_grads
+
 def adam(tparams, grads, inp):
     gshared = [theano.shared(p.get_value() * 0.,
                              name='%s_grad' % k)
@@ -65,11 +86,13 @@ class BasicAgent(object):
                  n_frames=1,
                  scale=0.1,
                  sigma=0.1,
-                 activ="lambda x: tensor.maximum(x, 0.)",
-                 #activ="lambda x: tensor.tanh(x)",
+                 #activ="lambda x: tensor.maximum(x, 0.)",
+                 activ="lambda x: tensor.tanh(x)",
                  explo_coeff=0.,
+                 epsilon=1e-2,
                  shared=False,
-                 mb_size=100):
+                 mb_size=100,
+                 normalize_obs=False):
 
         print action_space
         print obs_space
@@ -79,10 +102,12 @@ class BasicAgent(object):
         self.obs_space = obs_space
         self.disc_factor = disc_factor # not used yet
         self.n_frames = n_frames
-        self.scale = scale
+        self.scale = scale if scale > 0. else 1./n_hidden
         self.sigma = numpy.float32(sigma)
         self.explo_coeff = explo_coeff
         self.shared = shared
+        self.normalize_obs = normalize_obs
+        self.epsilon = epsilon
 
         self.activ = eval(activ)
 
@@ -107,7 +132,8 @@ class BasicAgent(object):
 
         self.f_cr_shared, self.f_cr_update = adam(self.params_cr, 
                                                   self.grads_cr,
-                                                  [self.obs, self.actions, self.rewards, self.r_hat_t1]) 
+                                                  [self.obs, self.actions, 
+                                                   self.rewards, self.r_hat_t1]) 
 
         self.f_shared, self.f_update = adam(self.params, 
                                             self.grads,
@@ -119,23 +145,28 @@ class BasicAgent(object):
 
         self.n_exp = self.n_exp + 1
         self.exps.append([])
+        self.curr_exp = []
 
     def episode_end(self):
         self.scores.append(numpy.sum([ex[2] for ex in self.exps[-1]]))
+        self.curr_exp = None
         self.begin = False
 
     def record(self, obs, reward):
+        obs = self.obs_norm(obs)
+
         if self.explo_coeff > 0.:
             if len(self.exps[-1]) > 1:
                 vel0 = ((self.exps[-1][-1][0] - obs) ** 2).sum()
                 reward = reward + self.explo_coeff * vel0
 
         self.exps[-1].append([obs, self.last_act, reward])
+        self.curr_exp.append([obs, self.last_act, reward])
 
     def count_exps(self):
         return len(self.exps)
 
-    def flush_exps(self, n=-1, worst_first=True):
+    def flush_exps(self, n=-1, worst_first=False):
         if n < 0:
             self.exps = []
             self.scores = []
@@ -196,10 +227,10 @@ class BasicAgent(object):
 
     def tensor_init(self):
         self.obs = tensor.matrix('obs', dtype='float32')
-        if type(self.action_space) == gym.spaces.discrete.Discrete:
-            self.actions = tensor.matrix('act', dtype='int64')
-        elif type(self.action_space) == gym.spaces.Box:
-            self.actions = tensor.matrix('act', dtype='float32')
+        #if type(self.action_space) == gym.spaces.discrete.Discrete:
+        #    self.actions = tensor.matrix('act', dtype='int64')
+        #elif type(self.action_space) == gym.spaces.Box:
+        self.actions = tensor.matrix('act', dtype='float32')
         self.rewards = tensor.vector('reward', dtype='float32')
         self.r_hat_t1 = tensor.vector('r_hat_t+1', dtype='float32')
 
@@ -221,9 +252,11 @@ class BasicAgent(object):
             self.pi = pi / pi.sum(1, keepdims=True)
             outs = [self.pi]
         elif type(self.action_space) == gym.spaces.Box:
-            pi = pi + self.sigma * self.trng.normal(size=pi.shape, dtype='float32')
-            #self.pi = pi
-            self.pi = tensor.nnet.sigmoid(pi)
+            #pi = pi + self.sigma * self.trng.normal(size=pi.shape, dtype='float32')
+            pi = tensor.nnet.sigmoid(pi)
+            #pi = (tensor.cos(pi) + 1.) / 2.
+            #pi = pi + self.sigma * self.trng.normal(size=pi.shape, dtype='float32')
+            self.pi = pi
             outs = [self.pi]
 
         self.forward = theano.function([self.obs], outs, name='forward')
@@ -237,22 +270,29 @@ class BasicAgent(object):
                                                  ), 
                                                  wrt=pp)
         elif type(self.action_space) == gym.spaces.Box:
-            self.grads = tensor.grad(-tensor.mean(self.r_hat), wrt=pp)
+            cost = -tensor.mean(self.r_hat)
+            cost = cost + ((self.rewards - self.rewards.mean())[:,None] * ((self.actions - self.pi) ** 2).sum(1)).mean()
+            self.grads = tensor.grad(cost, wrt=pp)
+
+        self.grads = weight_decay(self.params, self.grads)
+        self.grads = grad_clip(self.grads)
 
     def forward_cr_init(self):
-        #obs = ((self.obs - numpy.float32(self.obs_space.low)) / 
-        #        numpy.float32(self.obs_space.high - self.obs_space.low))
         obs = self.obs
         h = tensor.dot(obs, self.params_cr['W']) + self.params_cr['b']
         if type(self.action_space) == gym.spaces.discrete.Discrete:
-            h = h + self.params_cr['V'][self.actions[:,0]]
+            #h = h + self.params_cr['V'][self.actions[:,0]]
+            h = h + tensor.dot(self.pi, self.params_cr['V'])
         elif type(self.action_space) == gym.spaces.Box:
             h = h + tensor.dot(self.pi, self.params_cr['V'])
+        h = h + self.sigma * self.trng.normal(size=h.shape, dtype='float32')
         h = self.activ(h)
         for li in xrange(self.n_layers_cr):
             h = tensor.dot(h, self.params_cr['W{}'.format(li+1)]) + self.params_cr['b{}'.format(li+1)]
+            h = h + self.sigma * self.trng.normal(size=h.shape, dtype='float32')
             h = self.activ(h)
         self.r_hat = tensor.dot(h, self.params_cr['U']) + self.params_cr['c']
+        #self.r_hat = tensor.nnet.sigmoid(self.r_hat)
 
         self.forward_cr = theano.function([self.obs, self.actions], self.r_hat, name='forward_cr', on_unused_input='ignore')
 
@@ -260,10 +300,10 @@ class BasicAgent(object):
         pp = self.params_cr.values()
 
         self.cost_cr = tensor.mean((self.r_hat - self.disc_factor * self.r_hat_t1[:,None] - self.rewards[:,None]) ** 2)
-        #self.cost_cr = tensor.mean((self.r_hat - self.rewards[:,None]) ** 2)
         self.grads_cr = tensor.grad(self.cost_cr, wrt=pp)
-        #self.grads_cr = tensor.grad(tensor.mean((self.r_hat - (self.rewards[:,None] - self.rewards.mean())) ** 2), wrt=pp)
-        #self.grads_cr = tensor.grad(tensor.mean((self.r_hat - self.rewards[:,None]) ** 2), wrt=pp)
+
+        self.grads_cr = weight_decay(self.params_cr, self.grads_cr)
+        self.grads_cr = grad_clip(self.grads_cr)
 
         self.f_cost_cr = theano.function([self.obs, self.actions, self.rewards, self.r_hat_t1], self.cost_cr, on_unused_input='ignore')
 
@@ -274,6 +314,7 @@ class BasicAgent(object):
 
         # some stupid uniform-random sampling
         obs = numpy.zeros((n, self.n_frames * self.obs_dim())).astype('float32')
+        one_obs = numpy.zeros((1, self.n_frames * self.obs_dim())).astype('float32')
         if future:
             obs_t1 = numpy.zeros((n, self.n_frames * self.obs_dim())).astype('float32')
         if type(self.action_space) == gym.spaces.discrete.Discrete:
@@ -285,22 +326,43 @@ class BasicAgent(object):
         #ss = numpy.array(self.scores)
         #pp = numpy.exp(ss) / numpy.exp(ss).sum()
 
+        e_dict = OrderedDict()
+        o_dict = OrderedDict()
+
         for ni in xrange(n):
             e = numpy.random.choice(len(self.exps))
+            e_inc = True if e in e_dict else False
+
             #e = numpy.argmax(numpy.random.multinomial(1, pp))
             if future:
                 o = numpy.random.choice(len(self.exps[e])-1)
             else:
                 o = numpy.random.choice(len(self.exps[e]))
+
+            o_inc = True if o in o_dict else False
+
+            if e_inc and o_inc:
+                continue
+
+            one_obs = one_obs * 0.
+
             for ii in xrange(self.n_frames):
                 try:
-                    obs[ni,ii*self.obs_dim():(ii+1)*self.obs_dim()] = self.exps[e][o-ii][0].squeeze()
+                    one_obs[0,ii*self.obs_dim():(ii+1)*self.obs_dim()] = self.exps[e][o-ii][0].squeeze()
                 except IndexError:
                     pass
+
+            if ni > 0:
+                # try to remove correlated inputs
+                min_dist = numpy.min(((obs[:ni,:] - one_obs[0,:][None,:]) ** 2).sum(1))
+                if min_dist < self.epsilon:
+                    continue
+            obs[ni,:] = one_obs
+
             if future:
                 for ii in xrange(self.n_frames):
                     try:
-                        obs[ni,ii*self.obs_dim():(ii+1)*self.obs_dim()] = self.exps[e][o-ii+1][0].squeeze()
+                        obs_t1[ni,ii*self.obs_dim():(ii+1)*self.obs_dim()] = self.exps[e][o-ii+1][0].squeeze()
                     except IndexError:
                         pass
             acts[ni,:] = self.exps[e][o][1]
@@ -328,21 +390,33 @@ class BasicAgent(object):
 
         # one-step future
         [a_t1] = self.forward(obs_t1)
-        r_hat_t1 = self.forward_cr(obs_t1.squeeze(), a_t1.squeeze())
+        #if type(self.action_space) == gym.spaces.discrete.Discrete:
+            #a_t1 = numpy.argmax(a_t1, axis=1)
+        a_t1 = a_t1.squeeze().reshape((a_t1.shape[0], self.act_dim()))
+        obs_t1 = obs_t1.squeeze().reshape((obs_t1.shape[0], self.obs_dim() * self.n_frames))
+
+        r_hat_t1 = self.forward_cr(obs_t1, a_t1)
 
         self.f_cr_shared(obs, acts, rewards, r_hat_t1.squeeze())
         self.f_cr_update()
 
         return self.f_cost_cr(obs, acts, rewards, r_hat_t1.squeeze())
 
+    def obs_norm(self, observation):
+        if self.normalize_obs:
+            return (observation - self.obs_space.low) / (self.obs_space.high - self.obs_space.low)
+        else:
+            return observation
 
     def act(self, observation):
+        observation = self.obs_norm(observation)
+
         obs_win = numpy.zeros([1, self.obs_dim() * self.n_frames]).astype('float32')
         ii = 0
         obs_win[0,ii*self.obs_dim():(ii+1)*self.obs_dim()] = observation.squeeze()
         for ii in xrange(1,self.n_frames-1):
             try: 
-                obs_win[0,ii*self.obs_dim():(ii+1)*self.obs_dim()] = self.exps[-1][-ii][0].squeeze()
+                obs_win[0,ii*self.obs_dim():(ii+1)*self.obs_dim()] = self.curr_exp[-ii][0].squeeze()
             except IndexError:
                 pass
 
@@ -353,11 +427,11 @@ class BasicAgent(object):
             self.last_act = act
         elif type(self.action_space) == gym.spaces.Box:
             pi = outs[0]
-
             act = pi[0]
             #act = numpy.maximum(numpy.minimum(act, self.action_space.high), self.action_space.low)
-            act = act * (self.action_space.high - self.action_space.low) + self.action_space.low
             self.last_act = copy.copy(act)
+            act = act * (self.action_space.high - self.action_space.low) + self.action_space.low
+            #act = numpy.maximum(numpy.minimum(act, self.action_space.high), self.action_space.low)
 
         return act
 
@@ -370,12 +444,12 @@ if __name__ == '__main__':
 
     env = gym.make('Acrobot-v1' if len(sys.argv)<2 else sys.argv[1])
     agent = BasicAgent(env.action_space, env.observation_space, 
-            n_hidden=10, n_frames=2, 
-            n_layers=1, n_layers_cr=2,
-            sigma=.5,
-            scale=0.01, disc_factor=0.9, explo_coeff=0.,
+            n_hidden=100, n_frames=3, 
+            n_layers=0, n_layers_cr=0,
+            sigma=.1,
+            scale=.01, disc_factor=.9, explo_coeff=0.,
             shared=False,
-            mb_size=64)
+            mb_size=100)
 
     # You provide the directory to write to (can be an existing
     # directory, but can't contain previous monitor results. You can
@@ -384,22 +458,24 @@ if __name__ == '__main__':
     env.monitor.start(outdir, force=True, video_callable=lambda count: count % 50 == 0)
 
     episode_count = 10000
-    max_steps = 2000
+    max_steps = 1000
     reward = 0
     done = False
 
     dispFreq = 10
     #flushFreq = 100
 
-    max_exps = 100
+    max_exps = 10
 
-    burnin = 10
+    burnin = 0
 
     updateFreq = 1
-    update_steps = 10
+    update_steps = 1
 
     updateCrFreq = 1
-    updateCr_steps = 50
+    updateCr_steps = 10
+
+    avg_reward = None
 
     for i in range(episode_count):
         ob = env.reset()
@@ -425,18 +501,26 @@ if __name__ == '__main__':
                 break
         agent.episode_end()
 
-        if numpy.mod(i, dispFreq) == 0:
-            print 'Reward at {}-th trial: {}'.format(i, reward_epi)
+        if avg_reward is None:
+            avg_reward = reward_epi
+        else:
+            avg_reward = 0.9 * avg_reward + 0.1 * reward_epi
+
+        if numpy.mod(i+1, dispFreq) == 0:
+            print 'Actions: {} ... {}'.format(
+                        [e[1][0] for e in agent.exps[-1][:5]],
+                        [e[1][0] for e in agent.exps[-1][-5:]])
+            print 'Reward at {}-th trial: {}'.format(i, avg_reward)
+
+        if numpy.mod(i+1, updateCrFreq) == 0 and len(agent.exps) > 0:
+            #print 'Updating...',
+            for j in xrange(updateCr_steps):
+                cc = agent.update_cr()
+            print 'CR Cost {}'.format(cc)
+            #print 'Done'
 
         if i >= burnin:
-            if numpy.mod(i, updateCrFreq) == 0:
-                #print 'Updating...',
-                for j in xrange(updateCr_steps):
-                    cc = agent.update_cr()
-                print 'CR Cost {}'.format(cc)
-                #print 'Done'
-
-            if numpy.mod(i+1, updateFreq) == 0:
+            if numpy.mod(i+1, updateFreq) == 0 and len(agent.exps) > 0:
                 #print 'Updating...',
                 for j in xrange(update_steps):
                     agent.update()
