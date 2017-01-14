@@ -276,8 +276,9 @@ class BasicAgent(object):
         pp = self.params.values()
         mean_rewards = (self.mask * self.rewards).sum(-1, keepdims=True) / self.mask.sum(-1, keepdims=True)
         centered_rewards = self.rewards - self.v[:,:,0] - mean_rewards
-        #scaled_rewards = centered_rewards / tensor.maximum(1., centered_rewards.std(-1, keepdims=True))
-        scaled_rewards = centered_rewards 
+        mean2_rewards = (self.mask * (self.rewards ** 2)).sum(-1, keepdims=True) / self.mask.sum(-1, keepdims=True)
+        var_rewards = mean2_rewards - (mean_rewards ** 2)
+        scaled_rewards = centered_rewards  / tensor.maximum(1., tensor.sqrt(var_rewards))
 
         logprob = 0.
         reg = 0.
@@ -373,7 +374,7 @@ class BasicAgent(object):
         self.f_vupdate()
 
     def vupdate_done(self):
-        movavg(self.vparams, self.old_vparams, 0.5)
+        movavg(self.vparams, self.old_vparams, 0.95)
         transfer(self.old_vparams, self.vparams)
 
     def act(self, observation, prev_h, verbose=False):
