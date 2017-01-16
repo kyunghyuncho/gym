@@ -145,11 +145,13 @@ class Agent(object):
         for oi in xrange(self.n_out):
             pi = tensor.dot(h, self.params['U%d'%oi]) + self.params['c%d'%oi][None,:]
             pi = tensor.exp(pi - tensor.max(pi,-1,keepdims=True))
-            self.pi.append(pi / pi.sum(-1, keepdims=True))
+            self.pi.append(pi / (pi.sum(-1, keepdims=True)))
 
         prev = tensor.matrix('prev', dtype='float32')
         obs = tensor.matrix('obs', dtype='float32')
         obs_ = obs.flatten()
+
+        self.h_init = lambda x: numpy.float32(0.)
 
         h = eval(self.activ)(tensor.dot(obs_, self.params['W']) + self.params['b'][None,:])
 
@@ -157,7 +159,7 @@ class Agent(object):
         for oi in xrange(self.n_out):
             pi_ = tensor.dot(h, self.params['U%d'%oi]) + self.params['c%d'%oi][None,:]
             pi_ = tensor.exp(pi_ - tensor.max(pi_,-1,keepdims=True))
-            pi.append(pi_ / pi_.sum(-1, keepdims=True))
+            pi.append(pi_ / (pi_.sum(-1, keepdims=True)))
 
         self.forward = theano.function([obs, prev], [h] + pi, name='forward', on_unused_input='ignore')
 
@@ -181,8 +183,8 @@ class Agent(object):
         for oi in xrange(self.n_out):
             labs = actions_[:,oi].flatten()
             labs_idx = tensor.arange(labs.shape[0]) * self.out_dim + labs
-            logprob = logprob + (mask_ * tensor.log(self.pi[oi].flatten())[labs_idx])
-            reg = reg + (self.pi[oi] * tensor.log(self.pi[oi])).sum(-1).sum(0)
+            logprob = logprob + (mask_ * tensor.log(self.pi[oi].flatten()+1e-6)[labs_idx])
+            reg = reg - (self.pi[oi] * tensor.log(self.pi[oi]+1e-6)).sum(-1).sum(0)
 
         self.grads = tensor.grad(-tensor.mean(scaled_rewards * logprob + 
                                               self.reg_c * reg), wrt=pp)

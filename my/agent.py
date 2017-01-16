@@ -30,7 +30,8 @@ class MetaAgent(object):
                  vmovavg_coeff=0.,
                  truncate_gradient=-1,
                  optimizer='adam',
-                 agent='policy_ff'):
+                 agent='policy_ff',
+                 max_epi=-1):
         self.action_space = action_space
         self.obs_space = obs_space
         self.disc_factor = disc_factor # not used yet
@@ -40,6 +41,8 @@ class MetaAgent(object):
         self.n_ens = n_ens
         self.movavg_coeff = movavg_coeff
         self.vmovavg_coeff = vmovavg_coeff
+
+        self.max_epi = max_epi
 
         self.n_hidden = n_hidden
         self.n_act_bins = n_act_bins
@@ -70,6 +73,11 @@ class MetaAgent(object):
 
         self.n_exp = self.n_exp + 1
         self.exps.append([])
+
+        if self.max_epi > 0:
+            if self.n_exp > self.max_epi:
+                del self.exps[0]
+                self.n_exp = self.n_exp - 1
 
     def episode_end(self):
         self.begin = False
@@ -144,16 +152,13 @@ class MetaAgent(object):
         n = numpy.minimum(n, n_obs)
 
         # some stupid uniform-random sampling
-        obs = numpy.zeros((n, self.obs_dim())).astype('float32')
-        acts = numpy.zeros((n,n_out)).astype('float32')
-        rewards = numpy.zeros((n,)).astype('float32')
-
         obs = []
         acts = []
         rewards = []
 
         min_len = numpy.Inf
         max_len = -numpy.Inf
+
 
         for ni in xrange(n):
             e = numpy.random.choice(len(self.exps))
@@ -165,10 +170,13 @@ class MetaAgent(object):
             obs.append([e[0] for e in exp])
             acts.append([e[1] for e in exp])
 
+            discount = numpy.ones(len(exp)) * (1. - self.disc_factor)
+
+            rew = [e[2] for e in exp]
             rr = []
+
             for ai in xrange(len(exp)):
-                frew = numpy.sum([((1.-self.disc_factor)**i) * re[2] 
-                                  for i, re in enumerate(exp[ai:])])
+                frew = rew[ai] + numpy.sum(rew[ai+1:] * numpy.cumprod(discount[ai+1:]))
                 rr.append(frew)
             rewards.append(rr)
 
@@ -201,9 +209,9 @@ class MetaAgent(object):
         acts = self.act2net(acts)
 
         for agent in self.agents:
-            if self.n_ens < 2 or numpy.random.rand() < 0.5:
-                agent.f_shared(obs, acts.astype('int64'), rewards, mask)
-                agent.f_update()
+            #if self.n_ens < 2 or numpy.random.rand() < 0.5:
+            agent.f_shared(obs, acts.astype('int64'), rewards, mask)
+            agent.f_update()
 
     def update_done(self):
         if self.movavg_coeff > 0.:
@@ -232,6 +240,8 @@ class MetaAgent(object):
 
         observation = self.obs_norm(observation)
 
+        si = numpy.argmax(numpy.random.multinomial(1, numpy.ones(self.n_ens) / self.n_ens))
+
         h = []
         pi = 0.
         for ai, agent in enumerate(self.agents):
@@ -240,20 +250,24 @@ class MetaAgent(object):
 
             h.append(pi_t[0])
 
-            act = []
-            if ai == 0:
+            if si == ai:
                 pi = pi_t[1:]
-            else:
-                for ii, pp in enumerate(pi_t[1:]):
-                    pi[ii] += pp
+            #if ai == 0:
+            #    pi = pi_t[1:]
+            #else:
+            #    for ii, pp in enumerate(pi_t[1:]):
+            #        pi[ii] += pp
+        #pi = [pp / self.n_ens for pp in pi]
 
-        pi = [pp / self.n_ens for pp in pi]
-
+        act = []
         for oi in xrange(n_out):
             if sum(pi[oi][:-1]) > 1.0:
                 pi[oi][:] *= (1. - 1e-6)
 
             act.append(self.net2act(numpy.argmax(numpy.random.multinomial(1, pi[oi][0]))))
+
+        if numpy.sum(numpy.isnan(pi)) > 0:
+            import ipdb; ipdb.set_trace()
 
         if verbose:
             print pi
@@ -276,12 +290,13 @@ if __name__ == '__main__':
     env = gym.make('CartPole-v0' if len(sys.argv)<2 else sys.argv[1])
     agent = MetaAgent(env.action_space, env.observation_space, 
                       n_hidden=100, n_ens=1, 
-                      reg_c=0.,
-                      movavg_coeff=0.99, vmovavg_coeff=0.99,
+                      reg_c=10.,
+                      movavg_coeff=0., vmovavg_coeff=0.,
                       disc_factor=0.,
                       truncate_gradient=-1,
                       optimizer='adam',
-                      agent='policy_ff')
+                      agent='policy_rnn',
+                      max_epi=100)
 
     # You provide the directory to write to (can be an existing
     # directory, but can't contain previous monitor results. You can
@@ -289,27 +304,30 @@ if __name__ == '__main__':
     outdir = '/tmp/random-agent-results'
     env.monitor.start(outdir, force=True)
 
-    episode_count = 2000
+    episode_count = 20000
     max_steps = 200
     reward_avg = -numpy.Inf
     done = False
 
-    probFreq = 1000
+    probFreq = -1
     dispFreq = 10
-    flushFreq = 100
+    flushFreq = -1
     updateFreq = 1
-    update_steps = 10
-    mb_sz=16
+    update_steps = 5
+    mb_sz=10
 
     for i in range(episode_count):
         ob = env.reset()
 
         reward_epi = 0
         agent.episode_start()
-        prev_h = [numpy.zeros(agent.n_hidden)] * agent.n_ens
+        #prev_h = [numpy.zeros(agent.n_hidden)] * agent.n_ens
+        prev_h = []
+        for ag in agent.agents:
+            prev_h.append(ag.h_init(numpy.float32(ob[None,:])))
 
         for j in range(max_steps):
-            if numpy.mod(j, probFreq) == 0:
+            if probFreq > 0 and numpy.mod(j, probFreq) == 0:
                 action, prev_h = agent.act(ob, prev_h, True)
             else:
                 action, prev_h = agent.act(ob, prev_h, False)
@@ -328,7 +346,7 @@ if __name__ == '__main__':
         if numpy.mod(i, dispFreq) == 0:
             print 'Reward at {}-th trial: {}, {}'.format(i, reward_epi, reward_avg)
 
-        if numpy.mod(i, updateFreq) == 0:
+        if i >= agent.max_epi and numpy.mod(i, updateFreq) == 0:
             for j in xrange(update_steps):
                 agent.vupdate(mb_sz)
             agent.vupdate_done()
@@ -336,7 +354,7 @@ if __name__ == '__main__':
                 agent.update(mb_sz)
             agent.update_done()
 
-        if numpy.mod(i, flushFreq) == 0:
+        if flushFreq > 0 and numpy.mod(i, flushFreq) == 0:
             print 'Flushing experiences..',
             agent.flush_exps()
             print 'Done'
