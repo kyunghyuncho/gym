@@ -81,31 +81,116 @@ def transfer(p_from, p_to):
     for nn, vv in p_from.items():
         p_to[nn].set_value(vv.get_value())
 
-
-# The world's simplest agent!
-class BasicAgent(object):
+class VApprox(object):
 
     def __init__(self, 
-                 action_space, 
-                 obs_space,
+                 parent,
+                 obs_dim,
                  n_hidden=100,
                  disc_factor=0.,
-                 reg_c=0.,
-                 n_act_bins=100,
-                 activ='tanh'):
-        self.action_space = action_space
-        self.obs_space = obs_space
-        self.disc_factor = disc_factor # not used yet
-        self.reg_c = reg_c
-        self.activ = activ
+                 activ='tanh',
+                 movavg_coeff=0.):
 
-        self.n_hidden = n_hidden
-        self.n_act_bins = n_act_bins
+        self.parent = parent
+        self.obs_dim = obs_dim
 
-        self.n_exp = 0
-        self.exps = []
+        self.n_hidden   = n_hidden
+        self.disc_factor= disc_factor
+        self.activ      = activ
+        self.movavg_coeff = movavg_coeff
 
-        self.prepare_act_trans()
+        self.vars_init()
+
+        self.param_init()
+        self.forward_init()
+        self.grad_init()
+
+        self.f_shared, self.f_update = adam(self.vparams, 
+                                            self.vgrads,
+                                            [self.parent.obs, self.parent.rewards, 
+                                             self.parent.mask]) 
+
+    def param_init(self):
+        self.vparams = OrderedDict()
+
+        self.vparams['W'] = theano.shared(0.1 * numpy.random.randn(self.obs_dim, self.n_hidden).astype('float32'))
+        self.vparams['R'] = theano.shared(1. * orth(numpy.random.randn(self.n_hidden, self.n_hidden).astype('float32')))
+        self.vparams['b'] = theano.shared(numpy.zeros(self.n_hidden).astype('float32'))
+        self.vparams['Wu'] = theano.shared(0.1 * numpy.random.randn(self.obs_dim, self.n_hidden).astype('float32'))
+        self.vparams['Ru'] = theano.shared(1. * orth(numpy.random.randn(self.n_hidden, self.n_hidden).astype('float32')))
+        self.vparams['bu'] = theano.shared(numpy.zeros(self.n_hidden).astype('float32'))
+        self.vparams['U'] = theano.shared(0.1 * numpy.random.randn(self.n_hidden, 1).astype('float32'))
+        self.vparams['c'] = theano.shared(numpy.zeros(1).astype('float32'))
+
+        if self.movavg_coeff > 0.:
+            self.old_vparams = make_copy(self.vparams)
+
+    def vars_init(self):
+        pass
+
+    def forward_init(self):
+        self.parent.obs = tensor.tensor3('obs', dtype='float32')
+
+        def _scan(_obs, _h, W, R, b, Wu, Ru, bu):
+            _u = tensor.nnet.sigmoid(tensor.dot(_obs, Wu) + tensor.dot(_h, Ru) + bu[None,:])
+            h_ = eval(self.activ)(tensor.dot(_obs, W) + tensor.dot(_h, R) + b[None,:])
+            h_ = _u * _h + (1. - _u) * h_
+            return h_
+
+        h, _ = theano.scan(_scan,
+                        sequences=[self.parent.obs],
+                        outputs_info=[tensor.alloc(0., self.parent.obs.shape[1], self.n_hidden)],
+                        non_sequences=[
+                            self.vparams['W'], self.vparams['R'], self.vparams['b'],
+                            self.vparams['Wu'], self.vparams['Ru'], self.vparams['bu']
+                            ])
+        self.v = tensor.dot(h, self.vparams['U']) + self.vparams['c'][None,:]
+
+        self.vforward = theano.function([self.parent.obs], self.v, name='vforward')
+
+    def grad_init(self):
+        #self.rewards = tensor.matrix('reward', dtype='float32')
+        #self.mask = tensor.matrix('mask', dtype='float32')
+
+        mean_rewards = ((self.parent.mask * self.parent.rewards)
+                        .sum(-1, keepdims=True) / self.parent.mask.sum(-1, keepdims=True))
+
+        pp = self.vparams.values()
+        self.vgrads = tensor.grad((self.parent.mask * 
+                                   ((self.v[:,:,0] - (self.parent.rewards - 
+                                                      mean_rewards)) ** 2))
+                                   .mean(), wrt=pp)
+
+class Agent(object):
+
+    def __init__(self, 
+                 parent,
+                 obs_dim,
+                 n_out,
+                 out_dim,
+                 n_hidden=100,
+                 disc_factor=0.,
+                 reg_c=10.,
+                 activ='tanh',
+                 movavg_coeff=0.,
+                 vmovavg_coeff=0.):
+
+        self.parent = parent
+        self.obs_dim = obs_dim
+        self.n_out = n_out
+        self.out_dim = out_dim
+
+        self.n_hidden   = n_hidden
+        self.disc_factor= disc_factor
+        self.reg_c      = reg_c
+        self.activ      = activ
+        self.movavg_coeff = movavg_coeff
+
+        self.vars_init()
+
+        self.vapprox = VApprox(self, obs_dim, n_hidden=n_hidden, 
+                               disc_factor=disc_factor, activ=activ,
+                               movavg_coeff=vmovavg_coeff)
 
         self.param_init()
         self.forward_init()
@@ -116,10 +201,132 @@ class BasicAgent(object):
                                             [self.obs, self.actions, 
                                              self.rewards, self.mask]) 
 
-        self.f_vshared, self.f_vupdate = adam(self.vparams, 
-                                              self.vgrads,
-                                              [self.obs, self.rewards, 
-                                               self.mask]) 
+    def param_init(self):
+        self.params = OrderedDict()
+
+        self.params['W'] = theano.shared(0.1 * numpy.random.randn(self.obs_dim, self.n_hidden).astype('float32'))
+        self.params['R'] = theano.shared(1. * orth(numpy.random.randn(self.n_hidden, self.n_hidden).astype('float32')))
+        self.params['b'] = theano.shared(numpy.zeros(self.n_hidden).astype('float32'))
+        self.params['Wu'] = theano.shared(0.1 * numpy.random.randn(self.obs_dim, self.n_hidden).astype('float32'))
+        self.params['Ru'] = theano.shared(1. * orth(numpy.random.randn(self.n_hidden, self.n_hidden).astype('float32')))
+        self.params['bu'] = theano.shared(numpy.zeros(self.n_hidden).astype('float32'))
+        for oi in xrange(self.n_out):
+            self.params['U%d'%oi] = theano.shared(0.1 * numpy.random.randn(self.n_hidden, self.out_dim[oi]).astype('float32'))
+            self.params['c%d'%oi] = theano.shared(numpy.zeros(self.out_dim[oi]).astype('float32'))
+
+        if self.movavg_coeff > 0.:
+            self.old_params = make_copy(self.params)
+
+    def vars_init(self):
+        self.obs = tensor.tensor3('obs', dtype='float32')
+        self.actions = tensor.tensor3('act', dtype='int64')
+        self.rewards = tensor.matrix('reward', dtype='float32')
+        self.mask = tensor.matrix('mask', dtype='float32')
+
+    def forward_init(self):
+        def _scan(_obs, _h, W, R, b, Wu, Ru, bu):
+            _u = tensor.nnet.sigmoid(tensor.dot(_obs, Wu) + tensor.dot(_h, Ru) + bu[None,:])
+            h_ = eval(self.activ)(tensor.dot(_obs, W) + tensor.dot(_h, R) + b[None,:])
+            h_ = _u * _h + (1. - _u) * h_
+            return h_
+
+        h, _ = theano.scan(_scan,
+                           sequences=[self.obs],
+                           outputs_info=[tensor.alloc(0., self.obs.shape[1], self.n_hidden)],
+                           non_sequences=[
+                               self.params['W'], self.params['R'], self.params['b'],
+                               self.params['Wu'], self.params['Ru'], self.params['bu'],
+                               ])
+        self.pi = []
+        for oi in xrange(self.n_out):
+            pi = tensor.dot(h, self.params['U%d'%oi]) + self.params['c%d'%oi][None,:]
+            pi = tensor.exp(pi - tensor.max(pi,-1,keepdims=True))
+            self.pi.append(pi / pi.sum(-1, keepdims=True))
+
+        prev = tensor.matrix('prev', dtype='float32')
+        obs = tensor.matrix('obs', dtype='float32')
+
+        h = _scan(obs, prev, self.params['W'], self.params['R'], self.params['b'],
+                  self.params['Wu'], self.params['Ru'], self.params['bu'])
+
+        pi = []
+        for oi in xrange(self.n_out):
+            pi_ = tensor.dot(h, self.params['U%d'%oi]) + self.params['c%d'%oi][None,:]
+            pi_ = tensor.exp(pi_ - tensor.max(pi_,-1,keepdims=True))
+            pi.append(pi_ / pi_.sum(-1, keepdims=True))
+
+        self.forward = theano.function([obs, prev], [h] + pi, name='forward')
+
+    def grad_init(self):
+        #self.mov_std = theano.shared(numpy.float32(1.), 'std')
+
+        pp = self.params.values()
+        mean_rewards = (self.mask * self.rewards).sum(-1, keepdims=True) / self.mask.sum(-1, keepdims=True)
+        centered_rewards = self.rewards - self.vapprox.v[:,:,0] - mean_rewards
+        mean2_rewards = (self.mask * (self.rewards ** 2)).sum(-1, keepdims=True) / self.mask.sum(-1, keepdims=True)
+        var_rewards = mean2_rewards - (mean_rewards ** 2)
+        scaled_rewards = centered_rewards  / tensor.maximum(1., tensor.sqrt(var_rewards))
+        #scaled_rewards = centered_rewards
+
+        logprob = 0.
+        reg = 0.
+        for oi in xrange(self.n_out):
+            labs = self.actions[:,:,oi].flatten()
+            labs_idx = tensor.arange(labs.shape[0]) * self.out_dim + labs
+            logprob = logprob + ((self.mask * 
+                                  tensor.log(self.pi[oi].flatten())[labs_idx]
+                                  .reshape([self.actions.shape[0], 
+                                            self.actions.shape[1]])).sum(0))
+            reg = reg + (self.pi[oi] * tensor.log(self.pi[oi])).sum(-1).sum(0)
+
+        self.grads = tensor.grad(-tensor.mean(scaled_rewards * logprob + 
+                                              self.reg_c * reg), wrt=pp)
+
+
+# The world's simplest agent!
+class MetaAgent(object):
+
+    def __init__(self, 
+                 action_space, 
+                 obs_space,
+                 n_hidden=100,
+                 disc_factor=0.,
+                 reg_c=10.,
+                 n_act_bins=100,
+                 n_ens=1,
+                 activ='tanh',
+                 normalize_obs=False,
+                 movavg_coeff=0.,
+                 vmovavg_coeff=0.):
+        self.action_space = action_space
+        self.obs_space = obs_space
+        self.disc_factor = disc_factor # not used yet
+        self.reg_c = reg_c
+        self.activ = activ
+        self.normalize_obs = normalize_obs
+        self.n_ens = n_ens
+        self.movavg_coeff = movavg_coeff
+        self.vmovavg_coeff = vmovavg_coeff
+
+        self.n_hidden = n_hidden
+        self.n_act_bins = n_act_bins
+
+        self.n_exp = 0
+        self.exps = []
+
+        self.prepare_act_trans()
+
+        obs_dim = self.obs_dim()
+        out_dim, n_out = self.act_dim()
+
+        self.agents = []
+        for ei in xrange(n_ens):
+            self.agents.append(Agent(self, obs_dim, out_dim, n_out, 
+                                     n_hidden=n_hidden, disc_factor=disc_factor, 
+                                     reg_c=reg_c, activ=activ, 
+                                     movavg_coeff=movavg_coeff,
+                                     vmovavg_coeff=vmovavg_coeff))
+
 
     def episode_start(self):
         self.begin = True
@@ -137,7 +344,7 @@ class BasicAgent(object):
         #    self.exps[-1][ii][2] = rr
 
     def record(self, obs, reward):
-        self.exps[-1].append([obs, self.last_act, reward])
+        self.exps[-1].append([self.obs_norm(obs), self.last_act, reward])
 
     def flush_exps(self, n=-1):
         if n < 0:
@@ -151,6 +358,16 @@ class BasicAgent(object):
         else:
             raise Exception('Unsupported observation space')
 
+    def obs_norm(self, obs):
+        if not self.normalize_obs:
+            return obs
+
+        if type(self.obs_space) == gym.spaces.box.Box:
+            scale = self.obs_space.high - self.obs_space.low
+            return (obs - self.obs_space.low) / scale
+        else:
+            raise Exception('Unsupported observation space')
+
     def prepare_act_trans(self):
         if type(self.action_space) == gym.spaces.discrete.Discrete:
             self.act2net = (lambda x: x)
@@ -159,7 +376,7 @@ class BasicAgent(object):
             def trans_box(x):
                 h = self.action_space.high
                 l = self.action_space.low
-                bins = numpy.linspace(l, h, self.n_act_bins)
+                bins = numpy.linspace(l[0], h[0], self.n_act_bins)
 
                 x_ = numpy.digitize(x, bins) - 1
                 return x_
@@ -167,7 +384,7 @@ class BasicAgent(object):
             def trans_box_back(x):
                 h = self.action_space.high
                 l = self.action_space.low
-                bins = numpy.linspace(l, h, self.n_act_bins)
+                bins = numpy.linspace(l[0], h[0], self.n_act_bins)
 
                 return bins[x]
 
@@ -184,125 +401,9 @@ class BasicAgent(object):
         else:
             raise Exception('Unsupported observation space')
 
-    def param_init(self):
-        n_out, out_dim = self.act_dim()
-
-        self.params = OrderedDict()
-
-        self.params['W'] = theano.shared(0.1 * numpy.random.randn(self.obs_dim(), self.n_hidden).astype('float32'))
-        self.params['R'] = theano.shared(0.1 * orth(numpy.random.randn(self.n_hidden, self.n_hidden).astype('float32')))
-        self.params['b'] = theano.shared(numpy.zeros(self.n_hidden).astype('float32'))
-        self.params['Wu'] = theano.shared(0.1 * numpy.random.randn(self.obs_dim(), self.n_hidden).astype('float32'))
-        self.params['Ru'] = theano.shared(0.1 * orth(numpy.random.randn(self.n_hidden, self.n_hidden).astype('float32')))
-        self.params['bu'] = theano.shared(numpy.zeros(self.n_hidden).astype('float32'))
-        for oi in xrange(n_out):
-            self.params['U%d'%oi] = theano.shared(0.1 * numpy.random.randn(self.n_hidden, out_dim[oi]).astype('float32'))
-            self.params['c%d'%oi] = theano.shared(numpy.zeros(out_dim[oi]).astype('float32'))
-
-        self.old_params = make_copy(self.params)
-
-        self.vparams = OrderedDict()
-
-        self.vparams['W'] = theano.shared(0.1 * numpy.random.randn(self.obs_dim(), self.n_hidden).astype('float32'))
-        self.vparams['R'] = theano.shared(0.1 * orth(numpy.random.randn(self.n_hidden, self.n_hidden).astype('float32')))
-        self.vparams['b'] = theano.shared(numpy.zeros(self.n_hidden).astype('float32'))
-        self.vparams['Wu'] = theano.shared(0.1 * numpy.random.randn(self.obs_dim(), self.n_hidden).astype('float32'))
-        self.vparams['Ru'] = theano.shared(0.1 * orth(numpy.random.randn(self.n_hidden, self.n_hidden).astype('float32')))
-        self.vparams['bu'] = theano.shared(numpy.zeros(self.n_hidden).astype('float32'))
-        self.vparams['U'] = theano.shared(0.1 * numpy.random.randn(self.n_hidden, 1).astype('float32'))
-        self.vparams['c'] = theano.shared(numpy.zeros(1).astype('float32'))
-
-        self.old_vparams = make_copy(self.vparams)
-
-    def forward_init(self):
-        n_out, out_dim = self.act_dim()
-
-        self.obs = tensor.tensor3('obs', dtype='float32')
-
-        def _scan(_obs, _h, W, R, b, Wu, Ru, bu):
-            _u = tensor.nnet.sigmoid(tensor.dot(_obs, Wu) + tensor.dot(_h, Ru) + bu[None,:])
-            h_ = eval(self.activ)(tensor.dot(_obs, W) + tensor.dot(_h, R) + b[None,:])
-            h_ = _u * _h + (1. - _u) * h_
-            return h_
-
-        h, _ = theano.scan(_scan,
-                           sequences=[self.obs],
-                           outputs_info=[tensor.alloc(0., self.obs.shape[1], self.n_hidden)],
-                           non_sequences=[
-                               self.params['W'], self.params['R'], self.params['b'],
-                               self.params['Wu'], self.params['Ru'], self.params['bu'],
-                               ])
-        self.pi = []
-        for oi in xrange(n_out):
-            pi = tensor.dot(h, self.params['U%d'%oi]) + self.params['c%d'%oi][None,:]
-            pi = tensor.exp(pi - tensor.max(pi,-1,keepdims=True))
-            self.pi.append(pi / pi.sum(-1, keepdims=True))
-
-        prev = tensor.matrix('prev', dtype='float32')
-        obs = tensor.matrix('obs', dtype='float32')
-
-        h = _scan(obs, prev, self.params['W'], self.params['R'], self.params['b'],
-                  self.params['Wu'], self.params['Ru'], self.params['bu'])
-
-        pi = []
-        for oi in xrange(n_out):
-            pi_ = tensor.dot(h, self.params['U%d'%oi]) + self.params['c%d'%oi][None,:]
-            pi_ = tensor.exp(pi_ - tensor.max(pi_,-1,keepdims=True))
-            pi.append(pi_ / pi_.sum(-1, keepdims=True))
-
-        self.forward = theano.function([obs, prev], [h] + pi, name='forward')
-
-        h, _ = theano.scan(_scan,
-                        sequences=[self.obs],
-                        outputs_info=[tensor.alloc(0., self.obs.shape[1], self.n_hidden)],
-                        non_sequences=[
-                            self.vparams['W'], self.vparams['R'], self.vparams['b'],
-                            self.vparams['Wu'], self.vparams['Ru'], self.vparams['bu']
-                            ])
-        self.v = tensor.dot(h, self.vparams['U']) + self.vparams['c'][None,:]
-
-        self.vforward = theano.function([self.obs], self.v, name='vforward')
-
-    def grad_init(self):
-        n_out, out_dim = self.act_dim()
-
-        self.actions = tensor.tensor3('act', dtype='int64')
-        self.rewards = tensor.matrix('reward', dtype='float32')
-
-        self.mask = tensor.matrix('mask', dtype='float32')
-
-        #self.mov_std = theano.shared(numpy.float32(1.), 'std')
-
-        pp = self.params.values()
-        mean_rewards = (self.mask * self.rewards).sum(-1, keepdims=True) / self.mask.sum(-1, keepdims=True)
-        centered_rewards = self.rewards - self.v[:,:,0] - mean_rewards
-        mean2_rewards = (self.mask * (self.rewards ** 2)).sum(-1, keepdims=True) / self.mask.sum(-1, keepdims=True)
-        var_rewards = mean2_rewards - (mean_rewards ** 2)
-        scaled_rewards = centered_rewards  / tensor.maximum(1., tensor.sqrt(var_rewards))
-
-        logprob = 0.
-        reg = 0.
-        for oi in xrange(n_out):
-            labs = self.actions[:,:,oi].flatten()
-            labs_idx = tensor.arange(labs.shape[0]) * out_dim + labs
-            logprob = logprob + ((self.mask * 
-                                  tensor.log(self.pi[oi].flatten())[labs_idx]
-                                  .reshape([self.actions.shape[0], 
-                                            self.actions.shape[1]])).sum(0))
-            reg = reg + (self.pi[oi] * tensor.log(self.pi[oi])).sum(-1).sum(0)
-
-        self.grads = tensor.grad(-tensor.mean(scaled_rewards * logprob + 
-                                              self.reg_c * reg), wrt=pp)
-
-        pp = self.vparams.values()
-        self.vgrads = tensor.grad((self.mask * 
-                                   ((self.v[:,:,0] - (self.rewards - mean_rewards)) ** 2))
-                                   .mean(), wrt=pp)
-
     def collect_minibatch(self, n=100):
-        # TODO
         n_out, out_dim = self.act_dim()
-        n_obs = numpy.sum([len(ex) for ex in self.exps])
+        n_obs = len(self.exps)
 
         n = numpy.minimum(n, n_obs)
 
@@ -353,6 +454,9 @@ class BasicAgent(object):
         return obs_tensor, act_tensor, rew_tensor, mask
 
     def update(self, n=100):
+        if len(self.exps) < 2:
+            return
+
         obs, acts, rewards, mask = self.collect_minibatch(n)
 
         #self.mov_std.set_value(numpy.float32(0.8 * self.mov_std.get_value() + 
@@ -360,43 +464,62 @@ class BasicAgent(object):
 
         acts = self.act2net(acts)
 
-        self.f_shared(obs, acts.astype('int64'), rewards, mask)
-        self.f_update()
+        for agent in self.agents:
+            agent.f_shared(obs, acts.astype('int64'), rewards, mask)
+            agent.f_update()
 
     def update_done(self):
-        movavg(self.params, self.old_params, 0.95)
-        transfer(self.old_params, self.params)
+        if self.movavg_coeff > 0.:
+            for agent in self.agents:
+                movavg(agent.params, agent.old_params, 0.95)
+                transfer(agent.old_params, agent.params)
 
     def vupdate(self, n=100):
+        if len(self.exps) < 2:
+            return
+
         obs, acts, rewards, mask = self.collect_minibatch(n)
 
-        self.f_vshared(obs, rewards, mask)
-        self.f_vupdate()
+        for agent in self.agents:
+            agent.vapprox.f_shared(obs, rewards, mask)
+            agent.vapprox.f_update()
 
     def vupdate_done(self):
-        movavg(self.vparams, self.old_vparams, 0.95)
-        transfer(self.old_vparams, self.vparams)
+        if self.vmovavg_coeff > 0.:
+            for agent in self.agents:
+                movavg(agent.vapprox.vparams, agent.vapprox.old_vparams, 0.95)
+                transfer(agent.vapprox.old_vparams, agent.vapprox.vparams)
 
     def act(self, observation, prev_h, verbose=False):
         n_out, out_dim = self.act_dim()
 
-        pi_t = self.forward(numpy.float32(observation.reshape(1,-1)),
-                            numpy.float32(prev_h.reshape(1,-1)))
+        observation = self.obs_norm(observation)
 
-        if verbose:
-            print pi_t[1]
+        h = []
+        pi = 0.
+        for ai, agent in enumerate(self.agents):
+            pi_t = agent.forward(numpy.float32(observation.reshape(1,-1)),
+                                 numpy.float32(prev_h[ai].reshape(1,-1)))
 
-        h = pi_t[0]
+            h.append(pi_t[0])
 
-        act = []
+            act = []
+            if ai == 0:
+                pi = pi_t[1:]
+            else:
+                for ii, pp in enumerate(pi_t[1:]):
+                    pi[ii] += pp
+
+        pi = [pp / self.n_ens for pp in pi]
+
         for oi in xrange(n_out):
-            if sum(pi_t[1][oi,:-1]) > 1.0:
-                pi_t[1][oi,:] *= (1. - 1e-6)
+            if sum(pi[oi][:-1]) > 1.0:
+                pi[oi][:] *= (1. - 1e-6)
 
-            act.append(self.net2act(numpy.argmax(numpy.random.multinomial(1, pi_t[1][oi,:]))))
+            act.append(self.net2act(numpy.argmax(numpy.random.multinomial(1, pi[oi][0]))))
 
         if verbose:
-            print act
+            print pi
 
         self.last_act = act
 
@@ -412,8 +535,12 @@ if __name__ == '__main__':
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
 
+    #env = gym.make('BipedalWalker-v2' if len(sys.argv)<2 else sys.argv[1])
     env = gym.make('CartPole-v0' if len(sys.argv)<2 else sys.argv[1])
-    agent = BasicAgent(env.action_space, env.observation_space)
+    agent = MetaAgent(env.action_space, env.observation_space, 
+                      n_hidden=200, n_ens=3, 
+                      movavg_coeff=0.9, vmovavg_coeff=0.9,
+                      disc_factor=0.)
 
     # You provide the directory to write to (can be an existing
     # directory, but can't contain previous monitor results. You can
@@ -422,23 +549,23 @@ if __name__ == '__main__':
     env.monitor.start(outdir, force=True)
 
     episode_count = 2000
-    max_steps = 2000
+    max_steps = 200
     reward_avg = -numpy.Inf
     done = False
 
     probFreq = 1000
     dispFreq = 10
-    flushFreq = 10
+    flushFreq = 100
     updateFreq = 1
-    update_steps = 10
-    mb_sz=16
+    update_steps = 5
+    mb_sz=32
 
     for i in range(episode_count):
         ob = env.reset()
 
         reward_epi = 0
         agent.episode_start()
-        prev_h = numpy.zeros(agent.n_hidden)
+        prev_h = [numpy.zeros(agent.n_hidden)] * agent.n_ens
 
         for j in range(max_steps):
             if numpy.mod(j, probFreq) == 0:
