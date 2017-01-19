@@ -10,11 +10,13 @@ from collections import OrderedDict
 
 from utils import *
 
-class VApprox(object):
+class QApprox(object):
 
     def __init__(self, 
                  parent,
                  obs_dim,
+                 n_out,
+                 out_dim,
                  n_hidden=100,
                  disc_factor=0.,
                  activ='tanh',
@@ -24,12 +26,14 @@ class VApprox(object):
 
         self.parent = parent
         self.obs_dim = obs_dim
+        self.n_out = n_out
+        self.out_dim = out_dim
+        self.truncate_gradient = truncate_gradient
 
         self.n_hidden   = n_hidden
         self.disc_factor= disc_factor
         self.activ      = activ
         self.movavg_coeff = movavg_coeff
-        self.truncate_gradient = truncate_gradient
 
         self.vars_init()
 
@@ -37,32 +41,39 @@ class VApprox(object):
         self.forward_init()
         self.grad_init()
 
-        self.f_shared, self.f_update = eval(optimizer)(self.vparams, 
+        self.f_shared, self.f_update = eval(optimizer)(self.params, 
                                                        self.cost,
-                                                       self.vgrads,
-                                                       [self.parent.obs, self.parent.rewards, 
-                                                        self.parent.mask]) 
+                                                       self.grads,
+                                                       [self.obs, self.actions, 
+                                                        self.rewards, self.mask]) 
 
     def param_init(self):
-        self.vparams = OrderedDict()
+        self.params = OrderedDict()
 
-        self.vparams['W'] = theano.shared(0.1 * numpy.random.randn(self.obs_dim, self.n_hidden).astype('float32'))
-        self.vparams['R'] = theano.shared(0.01 * orth(numpy.random.randn(self.n_hidden, self.n_hidden).astype('float32')))
-        self.vparams['b'] = theano.shared(numpy.zeros(self.n_hidden).astype('float32'))
-        self.vparams['Wu'] = theano.shared(0.1 * numpy.random.randn(self.obs_dim, self.n_hidden).astype('float32'))
-        self.vparams['Ru'] = theano.shared(0.01 * orth(numpy.random.randn(self.n_hidden, self.n_hidden).astype('float32')))
-        self.vparams['bu'] = theano.shared(numpy.zeros(self.n_hidden).astype('float32'))
-        self.vparams['Wr'] = theano.shared(0.1 * numpy.random.randn(self.obs_dim, self.n_hidden).astype('float32'))
-        self.vparams['Rr'] = theano.shared(0.01 * orth(numpy.random.randn(self.n_hidden, self.n_hidden).astype('float32')))
-        self.vparams['br'] = theano.shared(numpy.zeros(self.n_hidden).astype('float32'))
-        self.vparams['U'] = theano.shared(0.1 * numpy.random.randn(self.n_hidden, 1).astype('float32'))
-        self.vparams['c'] = theano.shared(numpy.zeros(1).astype('float32'))
+        self.params['W_init'] = theano.shared(0.1 * numpy.random.randn(self.obs_dim, self.n_hidden).astype('float32'))
+        self.params['b_init'] = theano.shared(numpy.zeros(self.n_hidden).astype('float32'))
+
+        self.params['W'] = theano.shared(0.1 * numpy.random.randn(self.obs_dim, self.n_hidden).astype('float32'))
+        self.params['R'] = theano.shared(0.01 * orth(numpy.random.randn(self.n_hidden, self.n_hidden).astype('float32')))
+        self.params['b'] = theano.shared(numpy.zeros(self.n_hidden).astype('float32'))
+        self.params['Wu'] = theano.shared(0.1 * numpy.random.randn(self.obs_dim, self.n_hidden).astype('float32'))
+        self.params['Ru'] = theano.shared(0.01 * orth(numpy.random.randn(self.n_hidden, self.n_hidden).astype('float32')))
+        self.params['bu'] = theano.shared(numpy.zeros(self.n_hidden).astype('float32'))
+        self.params['Wr'] = theano.shared(0.1 * numpy.random.randn(self.obs_dim, self.n_hidden).astype('float32'))
+        self.params['Rr'] = theano.shared(0.01 * orth(numpy.random.randn(self.n_hidden, self.n_hidden).astype('float32')))
+        self.params['br'] = theano.shared(numpy.zeros(self.n_hidden).astype('float32'))
+        for oi in xrange(self.n_out):
+            self.params['U%d'%oi] = theano.shared(0.1 * numpy.random.randn(self.n_hidden, self.out_dim[oi]).astype('float32'))
+            self.params['c%d'%oi] = theano.shared(numpy.zeros(self.out_dim[oi]).astype('float32'))
 
         if self.movavg_coeff > 0.:
-            self.old_vparams = make_copy(self.vparams)
+            self.old_params = make_copy(self.params)
 
     def vars_init(self):
-        pass
+        self.obs = self.parent.obs
+        self.actions = self.parent.actions
+        self.rewards = self.parent.rewards
+        self.mask = self.parent.mask
 
     def forward_init(self):
         def _scan(_obs, _h, W, R, b, Wu, Ru, bu, Wr, Rr, br):
@@ -72,39 +83,43 @@ class VApprox(object):
             h_ = _u * _h + (1. - _u) * h_
             return h_
 
-        self.parent.obs = tensor.tensor3('obs', dtype='float32')
+        h0 = eval(self.activ)(tensor.dot(self.obs[0], self.params['W_init']) + self.params['b_init'])
 
         h, _ = theano.scan(_scan,
-                        sequences=[self.parent.obs],
-                        outputs_info=[tensor.alloc(0., self.parent.obs.shape[1], self.n_hidden)],
-                        non_sequences=[
-                            self.vparams['W'], self.vparams['R'], self.vparams['b'],
-                            self.vparams['Wu'], self.vparams['Ru'], self.vparams['bu'],
-                            self.vparams['Wr'], self.vparams['Rr'], self.vparams['br']
-                            ],
-                        truncate_gradient=self.truncate_gradient)
-        self.v = tensor.dot(h[-1], self.vparams['U']) + self.vparams['c']
-
-        self.vforward = theano.function([self.parent.obs], self.v, name='vforward')
+                           sequences=[self.obs],
+                           #outputs_info=[tensor.alloc(0., self.obs.shape[1], self.n_hidden)],
+                           outputs_info=[h0],
+                           non_sequences=[
+                               self.params['W'], self.params['R'], self.params['b'],
+                               self.params['Wu'], self.params['Ru'], self.params['bu'],
+                               self.params['Wr'], self.params['Rr'], self.params['br']
+                               ],
+                           truncate_gradient=self.truncate_gradient)
+        self.Q = []
+        for oi in xrange(self.n_out):
+            q = tensor.dot(h, self.params['U%d'%oi]) + self.params['c%d'%oi][None,:]
+            self.Q.append(q)
 
     def grad_init(self):
-        #mask_ = self.parent.mask.flatten()
-        #rewards_ = self.parent.rewards.flatten()
-        mask_ = self.parent.mask[0]
-        rewards_ = self.parent.rewards[0]
+        #self.mov_std = theano.shared(numpy.float32(1.), 'std')
 
-        #mean_rewards = ((self.parent.mask * self.parent.rewards)
-        #                .sum(-1, keepdims=True) / self.parent.mask.sum(-1, keepdims=True))
+        pp = self.params.values()
 
-        #pp = self.vparams.values()
-        #self.vgrads = tensor.grad((self.parent.mask * 
-        #                           ((self.v[:,:,0] - (self.parent.rewards - 
-        #                                              mean_rewards)) ** 2))
-        #                           .mean(), wrt=pp)
+        logprob = 0.
+        reg = 0.
+        for oi in xrange(self.n_out):
+            labs = self.actions[:,:,oi].flatten()
+            labs_idx = tensor.arange(labs.shape[0]) * self.out_dim + labs
+            Qt = self.Q[oi].flatten()[labs_idx].reshape([self.actions.shape[0], 
+                                                          self.actions.shape[1]])
+            Qt = Qt[:-1]
+            Qt1 = self.Q[oi].max(-1)[1:]
+            loss = (Qt - (self.rewards[:-1] + (1. - self.disc_factor) * Qt1)) ** 2
+            logprob = logprob - (self.mask[:-1] * loss).sum(0)
 
-        pp = self.vparams.values()
-        self.cost = (mask_ * ((self.v[:,0] + rewards_.mean() - rewards_) ** 2)).mean()
-        self.vgrads = tensor.grad(self.cost, wrt=pp)
+        self.cost = -tensor.mean(logprob)
+        self.grads = tensor.grad(self.cost, wrt=pp)
+
 
 class Agent(object):
 
@@ -136,7 +151,7 @@ class Agent(object):
 
         self.vars_init()
 
-        self.vapprox = VApprox(self, obs_dim, n_hidden=n_hidden, 
+        self.qapprox = QApprox(self, obs_dim, n_out, out_dim, n_hidden=n_hidden, 
                                disc_factor=disc_factor, activ=activ,
                                movavg_coeff=vmovavg_coeff,
                                truncate_gradient=truncate_gradient)
@@ -181,7 +196,6 @@ class Agent(object):
 
     def forward_init(self):
         def _scan(_obs, _h, W, R, b, Wu, Ru, bu, Wr, Rr, br):
-            #_h = theano.gradient.disconnected_grad(_h)
             _u = tensor.nnet.sigmoid(tensor.dot(_obs, Wu) + tensor.dot(_h, Ru) + bu[None,:])
             _r = tensor.nnet.sigmoid(tensor.dot(_obs, Wr) + tensor.dot(_h, Rr) + br[None,:])
             h_ = eval(self.activ)(tensor.dot(_obs, W) + _r * tensor.dot(_h, R) + b[None,:])
@@ -225,47 +239,47 @@ class Agent(object):
         self.forward = theano.function([obs, prev], [h] + pi, name='forward')
 
     def grad_init(self):
-        #self.mov_std = theano.shared(numpy.float32(1.), 'std')
-
-        rewards_ = self.rewards[0]
-        mean_rewards = rewards_.mean()
-        var_rewards = rewards_.var()
-
         pp = self.params.values()
-
-        #mean_rewards = (self.mask * self.rewards).sum(-1, keepdims=True) / tensor.maximum(1., self.mask.sum(-1, keepdims=True))
-        ##centered_rewards = self.rewards - self.vapprox.v[:,:,0] - mean_rewards
-        centered_rewards = rewards_ - mean_rewards - self.vapprox.v[:,0] 
-        #mean2_rewards = (self.mask * (self.rewards ** 2)).sum(-1, keepdims=True) / tensor.maximum(1., self.mask.sum(-1, keepdims=True))
-        #var_rewards = mean2_rewards - (mean_rewards ** 2)
-        scaled_rewards = centered_rewards  / tensor.maximum(1., tensor.sqrt(tensor.maximum(0., var_rewards)))
 
         logprob = 0.
         reg = 0.
         for oi in xrange(self.n_out):
             labs = self.actions[:,:,oi].flatten()
             labs_idx = tensor.arange(labs.shape[0]) * self.out_dim + labs
-            logprob = logprob + ((self.mask * 
+            Q_ = self.qapprox.Q[oi].flatten()[labs_idx].reshape([self.actions.shape[0], 
+                                                                 self.actions.shape[1]])
+
+            #scaled_rewards = self.rewards - Q_
+            scaled_rewards = Q_
+            scaled_rewards = scaled_rewards - scaled_rewards.mean()
+            scaled_rewards = scaled_rewards / tensor.maximum(1., scaled_rewards.std())
+
+            labs = self.actions[:,:,oi].flatten()
+            labs_idx = tensor.arange(labs.shape[0]) * self.out_dim + labs
+            logprob = logprob + (scaled_rewards * (self.mask * 
                                   tensor.log(self.pi[oi].flatten()+1e-6)[labs_idx]
                                   .reshape([self.actions.shape[0], 
-                                            self.actions.shape[1]])).sum(0))
+                                            self.actions.shape[1]]))).sum(0)
             reg = reg - (self.pi[oi] * tensor.log(self.pi[oi]+1e-6)).sum(-1).sum(0)
 
-        self.cost = -tensor.mean(scaled_rewards * logprob + self.reg_c * reg)
+        self.cost = -tensor.mean(logprob + self.reg_c * reg)
         self.grads = tensor.grad(self.cost, wrt=pp)
 
     def update(self, obs, acts, rewards, mask):
-        self.vapprox.f_shared(obs, rewards, mask)
-        self.vapprox.f_update()
+        cc_q = self.qapprox.f_shared(obs, acts.astype('int64'), rewards, mask)
+        self.qapprox.f_update()
 
-        self.f_shared(obs, acts.astype('int64'), rewards, mask)
+        cc = self.f_shared(obs, acts.astype('int64'), rewards, mask)
         self.f_update()
+
+        #print 'Cost {} Q-Cost {}'.format(cc, cc_q)
 
     def sync(self):
         movavg(self.params, self.old_params, self.movavg_coeff)
         transfer(self.old_params, self.params)
 
-        movavg(self.vapprox.vparams, self.vapprox.old_vparams, self.movavg_coeff)
-        transfer(self.vapprox.old_vparams, self.vapprox.vparams)
+        movavg(self.qapprox.params, self.qapprox.old_params, self.movavg_coeff)
+        transfer(self.qapprox.old_params, self.qapprox.params)
+
 
 

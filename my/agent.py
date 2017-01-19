@@ -9,6 +9,8 @@ from collections import OrderedDict
 
 import policy_ff
 import policy_rnn
+import policy_rnn1
+import policy_rnn_ac
 
 from utils import *
 import gym
@@ -81,11 +83,6 @@ class MetaAgent(object):
 
     def episode_end(self):
         self.begin = False
-
-        ## turn reward into future reward
-        #rlist = numpy.cumsum([e[2] for e in self.exps[-1]][::-1])[::-1]
-        #for ii, rr in enumerate(rlist):
-        #    self.exps[-1][ii][2] = rr
 
     def record(self, obs, reward):
         self.exps[-1].append([self.obs_norm(obs), self.last_act, reward])
@@ -174,7 +171,6 @@ class MetaAgent(object):
 
             rew = [e[2] for e in exp]
             rr = []
-
             for ai in xrange(len(exp)):
                 frew = rew[ai] + numpy.sum(rew[ai+1:] * numpy.cumprod(discount[ai+1:]))
                 rr.append(frew)
@@ -209,31 +205,12 @@ class MetaAgent(object):
         acts = self.act2net(acts)
 
         for agent in self.agents:
-            #if self.n_ens < 2 or numpy.random.rand() < 0.5:
-            agent.f_shared(obs, acts.astype('int64'), rewards, mask)
-            agent.f_update()
+            agent.update(obs, acts, rewards, mask)
 
     def update_done(self):
         if self.movavg_coeff > 0.:
             for agent in self.agents:
-                movavg(agent.params, agent.old_params, 0.95)
-                transfer(agent.old_params, agent.params)
-
-    def vupdate(self, n=100):
-        if len(self.exps) < 2:
-            return
-
-        obs, acts, rewards, mask = self.collect_minibatch(n)
-
-        for agent in self.agents:
-            agent.vapprox.f_shared(obs, rewards, mask)
-            agent.vapprox.f_update()
-
-    def vupdate_done(self):
-        if self.vmovavg_coeff > 0.:
-            for agent in self.agents:
-                movavg(agent.vapprox.vparams, agent.vapprox.old_vparams, 0.95)
-                transfer(agent.vapprox.old_vparams, agent.vapprox.vparams)
+                agent.sync()
 
     def act(self, observation, prev_h, verbose=False):
         n_out, out_dim = self.act_dim()
@@ -252,17 +229,17 @@ class MetaAgent(object):
 
             if si == ai:
                 pi = pi_t[1:]
-            #if ai == 0:
-            #    pi = pi_t[1:]
-            #else:
-            #    for ii, pp in enumerate(pi_t[1:]):
-            #        pi[ii] += pp
+        #    if ai == 0:
+        #        pi = pi_t[1:]
+        #    else:
+        #        for ii, pp in enumerate(pi_t[1:]):
+        #            pi[ii] += pp
         #pi = [pp / self.n_ens for pp in pi]
 
         act = []
         for oi in xrange(n_out):
             if sum(pi[oi][:-1]) > 1.0:
-                pi[oi][:] *= (1. - 1e-6)
+                pi[oi][:] *= (1. - 1e-4)
 
             act.append(self.net2act(numpy.argmax(numpy.random.multinomial(1, pi[oi][0]))))
 
@@ -290,12 +267,12 @@ if __name__ == '__main__':
     env = gym.make('CartPole-v0' if len(sys.argv)<2 else sys.argv[1])
     agent = MetaAgent(env.action_space, env.observation_space, 
                       n_hidden=100, n_ens=1, 
-                      reg_c=10.,
+                      reg_c=0.,
                       movavg_coeff=0., vmovavg_coeff=0.,
-                      disc_factor=0.,
+                      disc_factor=0.5,
                       truncate_gradient=-1,
                       optimizer='adam',
-                      agent='policy_rnn',
+                      agent='policy_rnn1',
                       max_epi=100)
 
     # You provide the directory to write to (can be an existing
@@ -313,7 +290,8 @@ if __name__ == '__main__':
     dispFreq = 10
     flushFreq = -1
     updateFreq = 1
-    update_steps = 5
+    update_steps = 10
+    syncFreq = 1
     mb_sz=10
 
     for i in range(episode_count):
@@ -347,9 +325,6 @@ if __name__ == '__main__':
             print 'Reward at {}-th trial: {}, {}'.format(i, reward_epi, reward_avg)
 
         if i >= agent.max_epi and numpy.mod(i, updateFreq) == 0:
-            for j in xrange(update_steps):
-                agent.vupdate(mb_sz)
-            agent.vupdate_done()
             for j in xrange(update_steps):
                 agent.update(mb_sz)
             agent.update_done()

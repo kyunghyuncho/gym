@@ -37,6 +37,7 @@ class VApprox(object):
         self.grad_init()
 
         self.f_shared, self.f_update = eval(optimizer)(self.vparams, 
+                                                       self.cost,
                                                        self.vgrads,
                                                        [self.parent.obs, self.parent.rewards, 
                                                         self.parent.mask]) 
@@ -71,8 +72,8 @@ class VApprox(object):
                         .sum(-1, keepdims=True) / mask_.sum(-1, keepdims=True))
 
         pp = self.vparams.values()
-        self.vgrads = tensor.grad((mask_ * ((self.v[:,0] - (rewards_-mean_rewards)) ** 2))
-                                   .mean(), wrt=pp)
+        self.cost = (mask_ * ((self.v[:,0] - (rewards_-mean_rewards)) ** 2)).mean()
+        self.vgrads = tensor.grad(self.cost, wrt=pp)
 
 class Agent(object):
 
@@ -114,6 +115,7 @@ class Agent(object):
         self.grad_init()
 
         self.f_shared, self.f_update = eval(optimizer)(self.params, 
+                                                       self.cost,
                                                        self.grads,
                                                        [self.obs, self.actions, 
                                                         self.rewards, self.mask]) 
@@ -186,7 +188,21 @@ class Agent(object):
             logprob = logprob + (mask_ * tensor.log(self.pi[oi].flatten()+1e-6)[labs_idx])
             reg = reg - (self.pi[oi] * tensor.log(self.pi[oi]+1e-6)).sum(-1).sum(0)
 
-        self.grads = tensor.grad(-tensor.mean(scaled_rewards * logprob + 
-                                              self.reg_c * reg), wrt=pp)
+        self.cost = -tensor.mean(scaled_rewards * logprob + self.reg_c * reg)
+        self.grads = tensor.grad(self.cost, wrt=pp)
+
+    def update(self, obs, acts, rewards, mask):
+        self.vapprox.f_shared(obs, rewards, mask)
+        self.vapprox.f_update()
+
+        self.f_shared(obs, acts.astype('int64'), rewards, mask)
+        self.f_update()
+
+    def sync(self):
+        movavg(self.params, self.old_params, self.movavg_coeff)
+        transfer(self.old_params, self.params)
+
+        movavg(self.vapprox.vparams, self.vapprox.old_vparams, self.movavg_coeff)
+        transfer(self.vapprox.old_vparams, self.vapprox.vparams)
 
 
