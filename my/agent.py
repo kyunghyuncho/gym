@@ -13,6 +13,8 @@ import policy_rnn1
 import policy_rnn_ac
 
 from utils import *
+import featex
+
 import gym
 
 # The world's simplest agent!
@@ -33,7 +35,11 @@ class MetaAgent(object):
                  truncate_gradient=-1,
                  optimizer='adam',
                  agent='policy_ff',
-                 max_epi=-1):
+                 max_epi=-1,
+                 featex=featex.nothing,
+                 featex_args=None,
+                 obs_reshape=lambda x, r: s,
+                 obs_shape=None):
         self.action_space = action_space
         self.obs_space = obs_space
         self.disc_factor = disc_factor # not used yet
@@ -66,7 +72,9 @@ class MetaAgent(object):
                                      movavg_coeff=movavg_coeff,
                                      vmovavg_coeff=vmovavg_coeff,
                                      truncate_gradient=truncate_gradient,
-                                     optimizer=optimizer))
+                                     optimizer=optimizer,
+                                     featex=featex, featex_args=featex_args,
+                                     obs_reshape=obs_reshape, obs_shape=obs_shape))
 
 
     def episode_start(self):
@@ -186,7 +194,7 @@ class MetaAgent(object):
 
         for ni in xrange(n):
             explen = len(rewards[ni])
-            obs_tensor[:explen,ni,:] = numpy.concatenate([oo[None,:] for oo in obs[ni][:]], axis=0)
+            obs_tensor[:explen,ni,:] = numpy.concatenate([oo.flatten()[None,:] for oo in obs[ni][:]], axis=0)
             act_tensor[:explen,ni,:] = numpy.concatenate([numpy.array(oo)[None,:] for oo in acts[ni][:]], axis=0)
             rew_tensor[:explen,ni] = rewards[ni][:]
             mask[:explen,ni] = 1.
@@ -222,7 +230,7 @@ class MetaAgent(object):
         h = []
         pi = 0.
         for ai, agent in enumerate(self.agents):
-            pi_t = agent.forward(numpy.float32(observation.reshape(1,-1)),
+            pi_t = agent.forward(numpy.float32(observation.reshape(1,-1)[None,:,:]),
                                  numpy.float32(prev_h[ai].reshape(1,-1)))
 
             h.append(pi_t[0])
@@ -263,8 +271,7 @@ if __name__ == '__main__':
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
 
-    #env = gym.make('BipedalWalker-v2' if len(sys.argv)<2 else sys.argv[1])
-    env = gym.make('CartPole-v0' if len(sys.argv)<2 else sys.argv[1])
+    env = gym.make('Pong-v0' if len(sys.argv)<2 else sys.argv[1])
     agent = MetaAgent(env.action_space, env.observation_space, 
                       n_hidden=100, n_ens=1, 
                       reg_c=0.,
@@ -272,8 +279,42 @@ if __name__ == '__main__':
                       disc_factor=0.5,
                       truncate_gradient=-1,
                       optimizer='adam',
-                      agent='policy_rnn1',
+                      agent='policy_rnn_ac',
+                      featex=featex.conv,
+                      featex_args=[[210, 160, 3],
+                                   #[4,32,4,'relu'],
+                                   #[4,32,4,'relu'],
+                                   [8,32,16,'relu']],
+                      obs_reshape=lambda x, s:
+                                    x.reshape([x.shape[0], x.shape[1]]+s),
+                      obs_shape=[210, 160, 3],
                       max_epi=100)
+    
+    probFreq = -1
+    dispFreq = 10
+    flushFreq = -1
+    updateFreq = 1
+    update_steps = 1
+    syncFreq = 1
+    mb_sz=1
+    #env = gym.make('CartPole-v0' if len(sys.argv)<2 else sys.argv[1])
+    #agent = MetaAgent(env.action_space, env.observation_space, 
+    #                  n_hidden=100, n_ens=1, 
+    #                  reg_c=0.,
+    #                  movavg_coeff=0., vmovavg_coeff=0.,
+    #                  disc_factor=0.5,
+    #                  truncate_gradient=-1,
+    #                  optimizer='adam',
+    #                  agent='policy_rnn_ac',
+    #                  max_epi=100)
+    #
+    #probFreq = -1
+    #dispFreq = 10
+    #flushFreq = -1
+    #updateFreq = 1
+    #update_steps = 10
+    #syncFreq = 1
+    #mb_sz=10
 
     # You provide the directory to write to (can be an existing
     # directory, but can't contain previous monitor results. You can
@@ -286,14 +327,6 @@ if __name__ == '__main__':
     reward_avg = -numpy.Inf
     done = False
 
-    probFreq = -1
-    dispFreq = 10
-    flushFreq = -1
-    updateFreq = 1
-    update_steps = 10
-    syncFreq = 1
-    mb_sz=10
-
     for i in range(episode_count):
         ob = env.reset()
 
@@ -302,14 +335,17 @@ if __name__ == '__main__':
         #prev_h = [numpy.zeros(agent.n_hidden)] * agent.n_ens
         prev_h = []
         for ag in agent.agents:
-            prev_h.append(ag.h_init(numpy.float32(ob[None,:])))
+            prev_h.append(ag.h_init(numpy.float32(numpy.expand_dims(ob,0).reshape(1,-1)[None,:,:])))
 
         for j in range(max_steps):
             if probFreq > 0 and numpy.mod(j, probFreq) == 0:
-                action, prev_h = agent.act(ob, prev_h, True)
+                action, prev_h = agent.act(numpy.expand_dims(ob,0), prev_h, True)
             else:
-                action, prev_h = agent.act(ob, prev_h, False)
-            ob, reward, done, _ = env.step(numpy.array(action))
+                action, prev_h = agent.act(numpy.expand_dims(ob,0), prev_h, False)
+            if type(action) is not numpy.array:
+                ob, reward, done, _ = env.step(numpy.array([action]))
+            else:
+                ob, reward, done, _ = env.step(numpy.array(action))
             agent.record(ob, reward)
             reward_epi  = reward_epi + reward
             if done:
@@ -324,7 +360,8 @@ if __name__ == '__main__':
         if numpy.mod(i, dispFreq) == 0:
             print 'Reward at {}-th trial: {}, {}'.format(i, reward_epi, reward_avg)
 
-        if i >= agent.max_epi and numpy.mod(i, updateFreq) == 0:
+        #if i >= agent.max_epi and numpy.mod(i, updateFreq) == 0:
+        if numpy.mod(i, updateFreq) == 0:
             for j in xrange(update_steps):
                 agent.update(mb_sz)
             agent.update_done()

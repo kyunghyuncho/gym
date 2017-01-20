@@ -7,7 +7,7 @@ from theano import tensor
 import numpy
 from collections import OrderedDict
 
-def sgd(tparams, grads, inp, clip_c=1.):
+def sgd(tparams, cost, grads, inp, clip_c=1.):
     g2 = 0.
     for g in grads:
         g2 += (g**2).sum()
@@ -25,14 +25,14 @@ def sgd(tparams, grads, inp, clip_c=1.):
                for k, p in tparams.iteritems()]
     gsup = [(gs, g) for gs, g in zip(gshared, grads)]
 
-    f_grad_shared = theano.function(inp, [], updates=gsup)
+    f_grad_shared = theano.function(inp, [cost], updates=gsup, on_unused_input='ignore')
 
     pup = [(p, p - lr0 * g) for p, g in zip(tparams.values(), gshared)]
-    f_update = theano.function([], [], updates=pup)
+    f_update = theano.function([], [], updates=pup, on_unused_input='ignore')
 
     return f_grad_shared, f_update
 
-def adam(tparams, grads, inp, clip_c=1.):
+def adam(tparams, cost, grads, inp, clip_c=1.):
     g2 = 0.
     for g in grads:
         g2 += (g**2).sum()
@@ -48,7 +48,7 @@ def adam(tparams, grads, inp, clip_c=1.):
                for k, p in tparams.iteritems()]
     gsup = [(gs, g) for gs, g in zip(gshared, grads)]
 
-    f_grad_shared = theano.function(inp, [], updates=gsup, profile=False)
+    f_grad_shared = theano.function(inp, [cost], updates=gsup, profile=False, on_unused_input='ignore')
 
     lr0 = numpy.float32(0.0002)
     b1 = numpy.float32(0.1)

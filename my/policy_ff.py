@@ -8,6 +8,7 @@ import numpy
 from collections import OrderedDict
 
 from utils import *
+import featex
 
 class VApprox(object):
 
@@ -19,7 +20,9 @@ class VApprox(object):
                  activ='tanh',
                  movavg_coeff=0.,
                  truncate_gradient=-1,
-                 optimizer='adam'):
+                 optimizer='adam',
+                 featex=featex.nothing,
+                 featex_args=None):
 
         self.parent = parent
         self.obs_dim = obs_dim
@@ -29,6 +32,9 @@ class VApprox(object):
         self.activ      = activ
         self.movavg_coeff = movavg_coeff
         self.truncate_gradient = truncate_gradient
+
+        self.featex = featex
+        self.featex_args = featex_args
 
         self.vars_init()
 
@@ -50,14 +56,18 @@ class VApprox(object):
         self.vparams['U'] = theano.shared(0.1 * numpy.random.randn(self.n_hidden, 1).astype('float32'))
         self.vparams['c'] = theano.shared(numpy.zeros(1).astype('float32'))
 
+        for pp, vv in self.fparams.items():
+            self.vparams[pp] = vv
+
         if self.movavg_coeff > 0.:
             self.old_vparams = make_copy(self.vparams)
 
     def vars_init(self):
-        pass
+        self.obs_, indim, self.fparams = self.featex(self.parent.obs, self.featex_args)
+        self.obs_dim = indim if indim is not None else self.obs_dim
 
     def forward_init(self):
-        obs_ = self.parent.obs.reshape([self.parent.obs.shape[0]*self.parent.obs.shape[1], self.parent.obs.shape[-1]])
+        obs_ = self.obs_.reshape([self.obs_.shape[0]*self.obs_.shape[1], self.obs_.shape[-1]])
 
         h = eval(self.activ)(tensor.dot(obs_, self.vparams['W']) + self.vparams['b'][None,:])
 
@@ -89,7 +99,11 @@ class Agent(object):
                  movavg_coeff=0.,
                  vmovavg_coeff=0.,
                  truncate_gradient=-1,
-                 optimizer='adam'):
+                 optimizer='adam',
+                 featex=featex.nothing,
+                 featex_args=None,
+                 obs_reshape=lambda x, r: s,
+                 obs_shape=None):
 
         self.parent = parent
         self.obs_dim = obs_dim
@@ -103,15 +117,23 @@ class Agent(object):
         self.activ      = activ
         self.movavg_coeff = movavg_coeff
 
+        self.obs_reshape = obs_reshape
+        self.obs_shape = obs_shape
+
+        self.featex = featex
+        self.featex_args = featex_args
+
         self.vars_init()
+
+        self.param_init()
+        self.forward_init()
 
         self.vapprox = VApprox(self, obs_dim, n_hidden=n_hidden, 
                                disc_factor=disc_factor, activ=activ,
                                movavg_coeff=vmovavg_coeff,
-                               truncate_gradient=truncate_gradient)
+                               truncate_gradient=truncate_gradient,
+                               featex=featex, featex_args=featex_args)
 
-        self.param_init()
-        self.forward_init()
         self.grad_init()
 
         self.f_shared, self.f_update = eval(optimizer)(self.params, 
@@ -129,6 +151,9 @@ class Agent(object):
             self.params['U%d'%oi] = theano.shared(0.1 * numpy.random.randn(self.n_hidden, self.out_dim[oi]).astype('float32'))
             self.params['c%d'%oi] = theano.shared(numpy.zeros(self.out_dim[oi]).astype('float32'))
 
+        for pp, vv in self.fparams.items():
+            self.params[pp] = vv
+
         if self.movavg_coeff > 0.:
             self.old_params = make_copy(self.params)
 
@@ -138,8 +163,13 @@ class Agent(object):
         self.rewards = tensor.matrix('reward', dtype='float32')
         self.mask = tensor.matrix('mask', dtype='float32')
 
+        self.obs_, indim, self.fparams = self.featex(self.obs_reshape(self.obs, 
+                                                     self.obs_shape), 
+                                                     self.featex_args)
+        self.obs_dim = indim if indim is not None else self.obs_dim
+
     def forward_init(self):
-        obs_ = self.obs.reshape([self.obs.shape[0]*self.obs.shape[1], self.obs.shape[-1]])
+        obs_ = self.obs_.reshape([self.obs_.shape[0]*self.obs_.shape[1], self.obs_.shape[-1]])
 
         h = eval(self.activ)(tensor.dot(obs_, self.params['W']) + self.params['b'][None,None,:])
 
@@ -150,8 +180,10 @@ class Agent(object):
             self.pi.append(pi / (pi.sum(-1, keepdims=True)))
 
         prev = tensor.matrix('prev', dtype='float32')
-        obs = tensor.matrix('obs', dtype='float32')
-        obs_ = obs.flatten()
+        #obs = tensor.matrix('obs', dtype='float32')
+        obs_ = self.obs_.reshape([self.obs_.shape[0]*self.obs_.shape[1], 
+                                  self.obs_.shape[-1]])
+        obs_ = obs_[0]
 
         self.h_init = lambda x: numpy.float32(0.)
 
@@ -163,7 +195,7 @@ class Agent(object):
             pi_ = tensor.exp(pi_ - tensor.max(pi_,-1,keepdims=True))
             pi.append(pi_ / (pi_.sum(-1, keepdims=True)))
 
-        self.forward = theano.function([obs, prev], [h] + pi, name='forward', on_unused_input='ignore')
+        self.forward = theano.function([self.obs, prev], [h] + pi, name='forward', on_unused_input='ignore')
 
     def grad_init(self):
         mask_ = self.mask.flatten()
